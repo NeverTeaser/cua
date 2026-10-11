@@ -735,6 +735,17 @@ fn format_node_line(node: &AXNode) -> String {
         }
     }
 
+    // Passive text can still be a useful pixel target (for example, a WeCom
+    // conversation). Expose its existing geometry without granting an action
+    // index. These are screen points, not window-local screenshot pixels.
+    if node.element_index.is_none() {
+        if let Some([x, y, w, h]) = node.frame {
+            if [x, y, w, h].iter().all(|v| v.is_finite()) && w > 0.0 && h > 0.0 {
+                parts.push_str(&format!(" [frame_screen_pt={x},{y},{w},{h}]"));
+            }
+        }
+    }
+
     parts
 }
 
@@ -883,6 +894,72 @@ fn leading_indent_depth(line: &str) -> usize {
 mod tests {
     use super::*;
     use std::cell::Cell;
+
+    #[test]
+    fn passive_geometry_survives_markdown_pruning_and_query_without_an_action_index() {
+        let mut node = AXNode {
+            element_index: None,
+            role: "AXStaticText".into(),
+            title: None,
+            value: Some("Conversation".into()),
+            description: None,
+            identifier: None,
+            help: None,
+            actions: vec![],
+            element_ptr: 0,
+            depth: 1,
+            parent_element_index: Some(0),
+            frame: Some([-100.5, 200.25, 180.0, 24.0]),
+            value_state: None,
+            value_description: None,
+            min_value: None,
+            max_value: None,
+            enabled: None,
+            selected: None,
+            in_web_content: false,
+        };
+        let parent = "- [0] AXWindow \"Conversation\"";
+        let passive = "- AXStaticText = \"Conversation\" [frame_screen_pt=-100.5,200.25,180,24]";
+        let mut lines = vec![(0, parent.into()), (1, format_node_line(&node))];
+        // The frame is useful even when the text repeats its parent's label.
+        prune_echo_text_rows(&mut lines);
+        assert_eq!(
+            filter_tree(&render_lines(&lines), "Conversation"),
+            format!("{parent}\n  {passive}\n")
+        );
+        assert_eq!(node.element_index, None);
+        assert!(node.actions.is_empty());
+
+        // Existing actionable rows retain their exact presentation.
+        node.element_index = Some(7);
+        node.actions.push("AXPress".into());
+        assert_eq!(
+            format_node_line(&node),
+            "- [7] AXStaticText = \"Conversation\" [actions=[press]]"
+        );
+        node.element_index = None;
+        node.actions.clear();
+
+        let mut invalid_frames = vec![None];
+        for axis in 0..4 {
+            for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+                let mut frame = [100.0, 200.0, 180.0, 24.0];
+                frame[axis] = invalid;
+                invalid_frames.push(Some(frame));
+            }
+        }
+        for axis in [2, 3] {
+            for invalid in [0.0, -1.0] {
+                let mut frame = [100.0, 200.0, 180.0, 24.0];
+                frame[axis] = invalid;
+                invalid_frames.push(Some(frame));
+            }
+        }
+        for frame in invalid_frames {
+            node.frame = frame;
+            assert_eq!(format_node_line(&node), "- AXStaticText = \"Conversation\"");
+        }
+    }
 
     #[test]
     fn writable_value_controls_are_addressable_without_actions() {
