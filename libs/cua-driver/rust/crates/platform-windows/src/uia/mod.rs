@@ -838,10 +838,12 @@ fn emit_cached_node(
         let ptr = retained.as_raw() as usize;
         std::mem::forget(retained);
 
+        // BoundingRectangle is already cached for every visited element.
+        // Passive text needs its geometry too, without acquiring an action index.
+        let (center_x, center_y, rect) = read_cached_bounding_rect_full(element);
         let node = if is_actionable {
             let idx = *counter;
             *counter += 1;
-            let (center_x, center_y, rect) = read_cached_bounding_rect_full(element);
             emitted_parent = Some(idx);
             UiaNode {
                 element_index: Some(idx),
@@ -874,9 +876,9 @@ fn emit_cached_node(
                 enabled,
                 selected,
                 element_ptr: ptr,
-                center_x: 0,
-                center_y: 0,
-                rect: None,
+                center_x,
+                center_y,
+                rect,
                 msaa_role: None,
                 depth,
                 parent_element_index: parent_index,
@@ -1123,6 +1125,15 @@ pub(crate) fn format_node_line(node: &UiaNode) -> String {
         if let Some(v) = &node.value {
             s.push_str(&format!(" = \"{}\"", v));
         }
+        // UIA and MSAA use physical screen pixels, unlike macOS AX points.
+        // These bounds locate passive content; they do not imply an AX/UIA action.
+        if let Some((left, top, right, bottom)) = node.rect {
+            if right > left && bottom > top {
+                let width = i64::from(right) - i64::from(left);
+                let height = i64::from(bottom) - i64::from(top);
+                s.push_str(&format!(" [frame_screen_px={left},{top},{width},{height}]"));
+            }
+        }
     }
     s
 }
@@ -1179,4 +1190,74 @@ fn filter_tree(markdown: &str, query: &str) -> String {
     let mut r = output.join("\n");
     r.push('\n');
     r
+}
+
+#[cfg(test)]
+mod passive_geometry_tests {
+    use super::*;
+
+    #[test]
+    fn passive_uia_and_msaa_geometry_survives_markdown_query_without_action_indices() {
+        let mut node = UiaNode {
+            element_index: None,
+            control_type: "Text".into(),
+            name: Some("Conversation".into()),
+            value: None,
+            automation_id: None,
+            help_text: None,
+            actions: vec![],
+            enabled: Some(true),
+            selected: None,
+            element_ptr: 0,
+            center_x: -200,
+            center_y: 212,
+            rect: Some((-300, 200, -100, 224)),
+            msaa_role: None,
+            depth: 1,
+            parent_element_index: Some(0),
+            in_web_content: false,
+        };
+        let parent = "- [0] Window \"WeCom\"";
+        let passive = "- Text \"Conversation\" [frame_screen_px=-300,200,200,24]";
+        // Both native backends call the same renderer. MSAA's static-text
+        // role is ROLE_SYSTEM_STATICTEXT (0x29).
+        for backend in [None, Some(0x29)] {
+            node.msaa_role = backend;
+            let lines = vec![(0, parent.into()), (1, format_node_line(&node))];
+            assert_eq!(
+                filter_tree(&render_lines(&lines), "Conversation"),
+                format!("{parent}\n  {passive}\n")
+            );
+            assert_eq!(node.element_index, None);
+            assert!(node.actions.is_empty());
+        }
+
+        // Existing actionable rows retain their exact presentation.
+        node.element_index = Some(7);
+        node.actions.push("invoke".into());
+        assert_eq!(
+            format_node_line(&node),
+            "- [7] Text \"Conversation\" [actions=[invoke]]"
+        );
+        node.element_index = None;
+        node.actions.clear();
+
+        for rect in [
+            None,
+            Some((0, 0, 0, 24)),
+            Some((0, 0, 200, 0)),
+            Some((10, 0, 0, 24)),
+            Some((0, 10, 200, 0)),
+        ] {
+            node.rect = rect;
+            assert_eq!(format_node_line(&node), "- Text \"Conversation\"");
+        }
+
+        // Subtraction must not overflow for provider-supplied i32 edges.
+        node.rect = Some((i32::MIN, 0, i32::MAX, 24));
+        assert_eq!(
+            format_node_line(&node),
+            "- Text \"Conversation\" [frame_screen_px=-2147483648,0,4294967295,24]"
+        );
+    }
 }
